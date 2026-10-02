@@ -21,6 +21,12 @@ python3 app.py --db airline_recovery.db
 - `POST /api/plans/{id}/validate`、`/lock`：校验并原子锁定方案。
 - `GET /api/disruptions/{id}/compare`：比较恢复方案成本。
 - `POST /api/flights/{id}/cancel`、`/recover`：取消和人工恢复。
+- `POST /api/quotas`：按机场与夜窗口维护临时起降额度。
+- `POST /api/plans/{id}/approval-items`：按方案版本登记待批事项并预留额度。
+- `POST /api/approval-items/{item_no}/approvals`：登记批复（文号幂等，重复批复只采一次），重新核对宵禁、维护、执勤与额度占用后只放行通过的航班。
+- `POST /api/approval-items/{item_no}/retry`：写入失败后按事项号重试未完成项。
+- `POST /api/approval-items/{item_no}/withdraw`、`POST /api/plans/{id}/withdraw`：撤回未执行部分并释放额度。
+- `GET /api/approval-console`：查看待批、已放行、撤回原因与额度占用。
 - `GET /api/state`、`GET /api/plans/{id}`：查询状态和影响。
 
 ## 测试

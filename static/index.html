@@ -1,3 +1,23 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>航班恢复控制台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef2f7;color:#182230;padding:0 20px}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}pre{background:#111827;color:#93c5fd;padding:15px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#0f766e;color:white;border:0;border-radius:6px}</style>
-<h1>航班恢复控制台</h1><p>查看航班、中断事件与恢复方案。写操作使用 JSON API 并携带 X-User-Id、X-Role。</p><section><input id="u" value="ops"><input id="r" value="ops_manager"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef2f7;color:#182230;padding:0 20px}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}pre{background:#111827;color:#93c5fd;padding:15px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#0f766e;color:white;border:0;border-radius:6px}h2{margin-top:0}.bar{position:sticky;top:0}</style>
+<h1>航班恢复控制台</h1><p>批复按方案版本登记待批事项：方案版本一变，旧批复立即失效；同一事项重复批复只采一次。批复到达后重新核对宵禁、维护、执勤与临时起降额度，只放行通过的航班；撤回退回未执行部分并释放额度，失败后按事项号重试。</p>
+<div class="bar"><input id="u" value="ops"><input id="r" value="ops_manager"><button onclick="load()">刷新</button></div>
+<section><h2>待批（含未完成重试项）</h2><pre id="pending"></pre></section>
+<section><h2>已放行</h2><pre id="released"></pre></section>
+<section><h2>撤回原因</h2><pre id="withdrawn"></pre></section>
+<section><h2>临时起降额度占用</h2><pre id="quotas"></pre></section>
+<section><h2>航班与方案</h2><pre id="state"></pre></section>
+<script>
+async function load(){
+  const headers={'X-User-Id':u.value,'X-Role':r.value};
+  const [c,s]=await Promise.all([fetch('/api/approval-console',{headers}),fetch('/api/state',{headers})]);
+  const cj=await c.json(), sj=await s.json();
+  pending.textContent=JSON.stringify({pending:cj.pending,failed:cj.failed,superseded:cj.superseded},null,2);
+  released.textContent=JSON.stringify(cj.released,null,2);
+  withdrawn.textContent=JSON.stringify(cj.withdrawn.map(i=>({item_no:i.item_no,flight_id:i.flight_id,reason:i.withdraw_reason,withdrawn_at:i.withdrawn_at})),null,2);
+  quotas.textContent=JSON.stringify(cj.quotas,null,2);
+  state.textContent=JSON.stringify(sj,null,2);
+}
+load()
+</script>
+</html>

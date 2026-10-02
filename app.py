@@ -7,7 +7,7 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -96,6 +96,22 @@ class Repository:
                 missed_connections INTEGER NOT NULL DEFAULT 0, UNIQUE(plan_id,flight_id)
             );
             CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS slot_quotas(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, airport TEXT NOT NULL, slot_date TEXT NOT NULL,
+                total INTEGER NOT NULL CHECK(total>=0), used INTEGER NOT NULL DEFAULT 0 CHECK(used>=0),
+                UNIQUE(airport,slot_date)
+            );
+            CREATE TABLE IF NOT EXISTS approval_items(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, item_no TEXT UNIQUE,
+                plan_id INTEGER NOT NULL REFERENCES recovery_plans(id), plan_revision INTEGER NOT NULL,
+                flight_id INTEGER NOT NULL REFERENCES flights(id), assignment_id INTEGER REFERENCES assignments(id),
+                airport TEXT NOT NULL, slot_date TEXT,
+                status TEXT NOT NULL DEFAULT 'pending', approval_ref TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0, occupied INTEGER NOT NULL DEFAULT 0,
+                fail_reasons TEXT, last_error TEXT, withdraw_reason TEXT,
+                submitted_at TEXT NOT NULL, approved_at TEXT, executed_at TEXT, withdrawn_at TEXT,
+                UNIQUE(plan_id,flight_id,plan_revision)
+            );
             """
         )
 
@@ -257,6 +273,7 @@ class AirlineRecoveryService:
             if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "方案已被其他人更新")
             self._insert_assignment(conn, plan_id, body, replace=True)
             conn.execute("UPDATE recovery_plans SET revision=revision+1 WHERE id=?", (plan_id,))
+            conn.execute("UPDATE approval_items SET status='superseded' WHERE plan_id=? AND status IN ('pending','failed')", (plan_id,))
             Repository.audit(conn, plan_id, actor, role, "assignment_reassigned", {"flight_id": body.get("flight_id")})
             return self.get_plan(plan_id)
 
@@ -412,6 +429,200 @@ class AirlineRecoveryService:
         plans = [self.get_plan(r["id"]) for r in conn.execute("SELECT id FROM recovery_plans ORDER BY id DESC LIMIT 20")]
         return {"flights": flights, "disruptions": [dict(r) for r in conn.execute("SELECT * FROM disruptions ORDER BY id DESC")], "plans": plans, "server_time": iso()}
 
+    # —— 临时起降额度与批复对账 ——
+    @staticmethod
+    def _night_slot_date(sta: datetime, airport: sqlite3.Row) -> str | None:
+        """到达时刻落在机场宵禁窗口内时，返回所属夜的日期(YYYY-MM-DD)，否则 None。"""
+        start, end = parse_clock(airport["curfew_start"]), parse_clock(airport["curfew_end"])
+        clock = sta.timetz().replace(tzinfo=None)
+        inside = clock >= start or clock < end if start > end else start <= clock < end
+        if not inside: return None
+        return sta.date().isoformat() if clock >= start else (sta.date() - timedelta(days=1)).isoformat()
+
+    def seed_slot_quota(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role != "ops_manager": raise ApiError(403, "quota_forbidden", "只有运行经理可以维护临时起降额度")
+        airport = str(body.get("airport", "")).upper().strip()
+        slot_date = str(body.get("slot_date", "")).strip()
+        total = body.get("total")
+        if not airport or not slot_date or not isinstance(total, int) or total < 0:
+            raise ApiError(400, "invalid_quota", "airport、slot_date(YYYY-MM-DD) 和非负整数 total 必填")
+        try: datetime.strptime(slot_date, "%Y-%m-%d")
+        except ValueError as exc: raise ApiError(400, "invalid_quota", "slot_date 格式应为 YYYY-MM-DD") from exc
+        with self.repo.tx() as conn:
+            if not conn.execute("SELECT 1 FROM airports WHERE code=?", (airport,)).fetchone():
+                raise ApiError(404, "airport_not_found", "机场不存在")
+            conn.execute("""INSERT INTO slot_quotas(airport,slot_date,total) VALUES(?,?,?)
+                            ON CONFLICT(airport,slot_date) DO UPDATE SET total=excluded.total""", (airport, slot_date, total))
+            return dict(conn.execute("SELECT * FROM slot_quotas WHERE airport=? AND slot_date=?", (airport, slot_date)).fetchone())
+
+    def _slot_date_for_assignment(self, conn: sqlite3.Connection, row: sqlite3.Row) -> str | None:
+        airport = conn.execute("SELECT * FROM airports WHERE code=?", (row["destination"],)).fetchone()
+        if not airport: return None
+        return self._night_slot_date(parse_time(row["new_sta"]), airport)
+
+    def submit_for_approval(self, plan_id: int, actor: str, role: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "approval_forbidden", "当前角色不能提交批复")
+        with self.repo.tx() as conn:
+            plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
+            if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
+            rows = [dict(r) for r in conn.execute("""SELECT a.*,f.flight_no,f.origin,f.destination FROM assignments a
+                                                      JOIN flights f ON f.id=a.flight_id
+                                                      WHERE a.plan_id=? AND a.status!='canceled' ORDER BY a.id""", (plan_id,))]
+            if not rows: raise ApiError(409, "empty_plan", "方案没有可提交的飞行调整")
+            items: list[dict[str, Any]] = []
+            for row in rows:
+                cur = conn.execute("""INSERT INTO approval_items(plan_id,plan_revision,flight_id,assignment_id,airport,status,submitted_at)
+                                      VALUES(?,?,?,?,?, 'pending', ?)
+                                      ON CONFLICT(plan_id,flight_id,plan_revision) DO NOTHING""",
+                                   (plan_id, plan["revision"], row["flight_id"], row["id"], row["destination"], iso()))
+                if cur.lastrowid:
+                    conn.execute("UPDATE approval_items SET item_no=? WHERE id=?", (f"AP{cur.lastrowid:06d}", cur.lastrowid))
+                item = conn.execute("SELECT * FROM approval_items WHERE plan_id=? AND flight_id=? AND plan_revision=?",
+                                    (plan_id, row["flight_id"], plan["revision"])).fetchone()
+                slot_date = self._slot_date_for_assignment(conn, row)
+                if slot_date and not item["occupied"]:
+                    reserved = conn.execute("UPDATE slot_quotas SET used=used+1 WHERE airport=? AND slot_date=? AND used<total",
+                                            (row["destination"], slot_date))
+                    if reserved.rowcount:
+                        conn.execute("UPDATE approval_items SET occupied=1, slot_date=?, last_error=NULL WHERE id=?", (slot_date, item["id"]))
+                    else:
+                        conn.execute("UPDATE approval_items SET last_error='quota_exhausted' WHERE id=?", (item["id"],))
+                items.append(dict(conn.execute("SELECT * FROM approval_items WHERE id=?", (item["id"],)).fetchone()))
+            Repository.audit(conn, plan_id, actor, role, "approval_submitted", {"plan_revision": plan["revision"], "item_count": len(items)})
+            return {"plan_id": plan_id, "plan_revision": plan["revision"], "items": items}
+
+    def record_approval(self, item_no: str, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "approval_forbidden", "当前角色不能登记批复")
+        approval_ref = str(body.get("approval_ref", "")).strip()
+        if not approval_ref: raise ApiError(400, "approval_ref_required", "批复文号 approval_ref 必填")
+        with self.repo.tx() as conn:
+            item = conn.execute("SELECT * FROM approval_items WHERE item_no=?", (item_no,)).fetchone()
+            if not item: raise ApiError(404, "approval_item_not_found", "待批事项不存在")
+            plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (item["plan_id"],)).fetchone()
+            if item["status"] in ("executed", "withdrawn"):
+                return {"item": dict(item), "idempotent": True}
+            if item["status"] == "superseded" or plan["revision"] != item["plan_revision"]:
+                if item["status"] != "superseded":
+                    conn.execute("UPDATE approval_items SET status='superseded' WHERE id=?", (item["id"],))
+                Repository.audit(conn, plan["id"], actor, role, "approval_stale",
+                                 {"item_no": item_no, "plan_revision": item["plan_revision"], "current_revision": plan["revision"]})
+                raise ApiError(409, "approval_stale", "方案版本已变化，该事项的旧批复立即失效")
+            if item["approval_ref"] == approval_ref:
+                return {"item": dict(item), "idempotent": True}
+            return self._process_approval(conn, item, approval_ref, actor, role)
+
+    def _process_approval(self, conn: sqlite3.Connection, item: sqlite3.Row, approval_ref: str, actor: str, role: str) -> dict[str, Any]:
+        conn.execute("UPDATE approval_items SET attempts=attempts+1, approval_ref=? WHERE id=?", (approval_ref, item["id"]))
+        row = conn.execute("""SELECT a.*,f.flight_no,f.origin,f.destination,f.passenger_count FROM assignments a
+                              JOIN flights f ON f.id=a.flight_id WHERE a.id=?""", (item["assignment_id"],)).fetchone()
+        problems: list[dict[str, Any]] = []
+        slot_date: str | None = None
+        if not row:
+            problems.append({"code": "assignment_missing"})
+        else:
+            sta = parse_time(row["new_sta"])
+            aircraft = conn.execute("SELECT * FROM aircraft WHERE id=?", (row["aircraft_id"],)).fetchone()
+            crew = conn.execute("SELECT * FROM crew WHERE id=?", (row["crew_id"],)).fetchone()
+            airport = conn.execute("SELECT * FROM airports WHERE code=?", (row["destination"],)).fetchone()
+            if not aircraft or aircraft["status"] != "active":
+                problems.append({"code": "aircraft_unavailable"})
+            elif parse_time(aircraft["maintenance_due"]) < sta:
+                problems.append({"code": "maintenance_due", "resource": aircraft["id"]})
+            if not crew or crew["status"] != "active":
+                problems.append({"code": "crew_unavailable"})
+            elif (sta - parse_time(crew["duty_start"])).total_seconds() / 60 > crew["max_duty_minutes"]:
+                problems.append({"code": "duty_limit", "resource": crew["id"]})
+            if airport:
+                slot_date = self._night_slot_date(sta, airport)
+                if slot_date and not item["occupied"]:
+                    quota = conn.execute("SELECT * FROM slot_quotas WHERE airport=? AND slot_date=?", (row["destination"], slot_date)).fetchone()
+                    if not quota:
+                        problems.append({"code": "quota_not_configured", "airport": row["destination"], "slot_date": slot_date})
+                    elif quota["used"] >= quota["total"]:
+                        problems.append({"code": "quota_exhausted", "airport": row["destination"], "slot_date": slot_date})
+        if problems:
+            conn.execute("UPDATE approval_items SET status='failed', fail_reasons=?, last_error=? WHERE id=?",
+                         (json.dumps(problems, ensure_ascii=False), problems[0]["code"], item["id"]))
+            Repository.audit(conn, item["plan_id"], actor, role, "approval_failed", {"item_no": item["item_no"], "reasons": problems})
+            return {"item": dict(conn.execute("SELECT * FROM approval_items WHERE id=?", (item["id"],)).fetchone()),
+                    "executed": False, "reasons": problems}
+        if slot_date and not item["occupied"]:
+            reserved = conn.execute("UPDATE slot_quotas SET used=used+1 WHERE airport=? AND slot_date=? AND used<total",
+                                   (row["destination"], slot_date))
+            if reserved.rowcount == 0:
+                problems = [{"code": "quota_exhausted", "airport": row["destination"], "slot_date": slot_date}]
+                conn.execute("UPDATE approval_items SET status='failed', fail_reasons=?, last_error=? WHERE id=?",
+                             (json.dumps(problems, ensure_ascii=False), "quota_exhausted", item["id"]))
+                Repository.audit(conn, item["plan_id"], actor, role, "approval_failed", {"item_no": item["item_no"], "reasons": problems})
+                return {"item": dict(conn.execute("SELECT * FROM approval_items WHERE id=?", (item["id"],)).fetchone()),
+                        "executed": False, "reasons": problems}
+        conn.execute("""UPDATE approval_items SET status='executed', slot_date=?, occupied=1, approved_at=?, executed_at=?,
+                        fail_reasons=NULL, last_error=NULL WHERE id=?""",
+                     (slot_date, iso(), iso(), item["id"]))
+        Repository.audit(conn, item["plan_id"], actor, role, "approval_executed", {"item_no": item["item_no"], "slot_date": slot_date})
+        return {"item": dict(conn.execute("SELECT * FROM approval_items WHERE id=?", (item["id"],)).fetchone()),
+                "executed": True, "reasons": []}
+
+    def _release_quota(self, conn: sqlite3.Connection, item: sqlite3.Row) -> None:
+        if item["occupied"] and item["slot_date"]:
+            conn.execute("UPDATE slot_quotas SET used=MAX(0,used-1) WHERE airport=? AND slot_date=?", (item["airport"], item["slot_date"]))
+
+    def withdraw_item(self, item_no: str, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "approval_forbidden", "当前角色不能撤回批复")
+        reason = str(body.get("reason", "")).strip()
+        if not reason: raise ApiError(400, "reason_required", "撤回原因必填")
+        with self.repo.tx() as conn:
+            item = conn.execute("SELECT * FROM approval_items WHERE item_no=?", (item_no,)).fetchone()
+            if not item: raise ApiError(404, "approval_item_not_found", "待批事项不存在")
+            if item["status"] == "withdrawn": return {"item": dict(item), "idempotent": True}
+            if item["status"] == "executed": raise ApiError(409, "already_executed", "已放行航班不能撤回")
+            self._release_quota(conn, item)
+            conn.execute("UPDATE approval_items SET status='withdrawn', withdraw_reason=?, withdrawn_at=?, occupied=0 WHERE id=?",
+                         (reason, iso(), item["id"]))
+            Repository.audit(conn, item["plan_id"], actor, role, "approval_withdrawn", {"item_no": item_no, "reason": reason})
+            return {"item": dict(conn.execute("SELECT * FROM approval_items WHERE id=?", (item["id"],)).fetchone()), "idempotent": False}
+
+    def withdraw_plan(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "approval_forbidden", "当前角色不能撤回批复")
+        reason = str(body.get("reason", "")).strip()
+        if not reason: raise ApiError(400, "reason_required", "撤回原因必填")
+        with self.repo.tx() as conn:
+            plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
+            if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
+            items = [dict(r) for r in conn.execute("SELECT * FROM approval_items WHERE plan_id=? AND status NOT IN ('executed','withdrawn')", (plan_id,))]
+            for item in items:
+                self._release_quota(conn, conn.execute("SELECT * FROM approval_items WHERE id=?", (item["id"],)).fetchone())
+                conn.execute("UPDATE approval_items SET status='withdrawn', withdraw_reason=?, withdrawn_at=?, occupied=0 WHERE id=?",
+                             (reason, iso(), item["id"]))
+            Repository.audit(conn, plan_id, actor, role, "plan_withdrawn", {"reason": reason, "withdrawn_count": len(items)})
+            return {"plan_id": plan_id, "withdrawn_count": len(items),
+                    "items": [dict(conn.execute("SELECT * FROM approval_items WHERE id=?", (item["id"],)).fetchone()) for item in items]}
+
+    def retry_item(self, item_no: str, actor: str, role: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "approval_forbidden", "当前角色不能重试批复")
+        with self.repo.tx() as conn:
+            item = conn.execute("SELECT * FROM approval_items WHERE item_no=?", (item_no,)).fetchone()
+            if not item: raise ApiError(404, "approval_item_not_found", "待批事项不存在")
+            if item["status"] == "executed": return {"item": dict(item), "idempotent": True}
+            if item["status"] in ("withdrawn", "superseded"): raise ApiError(409, "not_retryable", "已撤回或已失效事项不能重试")
+            if item["status"] == "pending" or not item["approval_ref"]: raise ApiError(409, "no_approval", "待批事项尚无批复，不能重试")
+            plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (item["plan_id"],)).fetchone()
+            if plan["revision"] != item["plan_revision"]:
+                conn.execute("UPDATE approval_items SET status='superseded' WHERE id=?", (item["id"],))
+                raise ApiError(409, "approval_stale", "方案版本已变化，该事项的旧批复立即失效")
+            return self._process_approval(conn, item, item["approval_ref"], actor, role)
+
+    def approval_console(self, actor: str, role: str) -> dict[str, Any]:
+        conn = self.repo.conn
+        items = [dict(r) for r in conn.execute("SELECT * FROM approval_items ORDER BY id DESC")]
+        quotas = [dict(r) for r in conn.execute("SELECT * FROM slot_quotas ORDER BY airport,slot_date")]
+        return {"pending": [i for i in items if i["status"] == "pending"],
+                "failed": [i for i in items if i["status"] == "failed"],
+                "released": [i for i in items if i["status"] == "executed"],
+                "withdrawn": [i for i in items if i["status"] == "withdrawn"],
+                "superseded": [i for i in items if i["status"] == "superseded"],
+                "quotas": quotas, "server_time": iso()}
+
 
 def respond(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
     raw = json.dumps(payload, ensure_ascii=False, default=str).encode()
@@ -433,6 +644,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health": return 200, {"status": "ok", "service": "airline-recovery"}
         actor, role = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state()
+        if path == "/api/approval-console": return 200, self.service.approval_console(actor, role)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["api", "disruptions"] and parts[2].isdigit() and parts[3] == "compare": return 200, self.service.compare_plans(int(parts[2]))
@@ -444,6 +656,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/aircraft": lambda: (201, self.service.seed_aircraft(actor, role, body)),
             "/api/crew": lambda: (201, self.service.seed_crew(actor, role, body)),
             "/api/permits": lambda: (201, self.service.create_permit(actor, role, body)),
+            "/api/quotas": lambda: (201, self.service.seed_slot_quota(actor, role, body)),
             "/api/flights": lambda: (201, self.service.create_flight(actor, role, body)),
             "/api/disruptions": lambda: (201, self.service.create_disruption(actor, role, body)),
             "/api/recovery-plans": lambda: (201, self.service.create_plan(actor, role, body)),
@@ -454,6 +667,13 @@ class Handler(BaseHTTPRequestHandler):
             if action == "assignments": return 200, self.service.add_assignment(plan_id, actor, role, body)
             if action == "validate": return 200, self.service.validate_plan(plan_id, actor, role)
             if action == "lock": return 200, self.service.lock_plan(plan_id, actor, role, body)
+            if action == "approval-items": return 201, self.service.submit_for_approval(plan_id, actor, role, body)
+            if action == "withdraw": return 200, self.service.withdraw_plan(plan_id, actor, role, body)
+        if len(parts) == 4 and parts[:2] == ["api", "approval-items"]:
+            item_no, action = parts[2], parts[3]
+            if action == "approvals": return 200, self.service.record_approval(item_no, actor, role, body)
+            if action == "withdraw": return 200, self.service.withdraw_item(item_no, actor, role, body)
+            if action == "retry": return 200, self.service.retry_item(item_no, actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "flights"] and parts[2].isdigit():
             flight_id, action = int(parts[2]), parts[3]
             if action == "cancel": return 200, self.service.cancel_flight(flight_id, actor, role, body)
