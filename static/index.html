@@ -1,3 +1,69 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>航班恢复控制台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef2f7;color:#182230;padding:0 20px}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}pre{background:#111827;color:#93c5fd;padding:15px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#0f766e;color:white;border:0;border-radius:6px}</style>
-<h1>航班恢复控制台</h1><p>查看航班、中断事件与恢复方案。写操作使用 JSON API 并携带 X-User-Id、X-Role。</p><section><input id="u" value="ops"><input id="r" value="ops_manager"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>
+body{font:15px system-ui;max-width:1180px;margin:32px auto;background:#eef2f7;color:#182230;padding:0 20px}
+section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}
+pre{background:#111827;color:#93c5fd;padding:15px;overflow:auto;border-radius:8px}
+input,button,select{font:inherit;padding:8px;margin:4px}
+button{background:#0f766e;color:white;border:0;border-radius:6px;cursor:pointer}
+button.atc{background:#1d4ed8}button.danger{background:#b91c1c}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #d7dee8;padding:6px 8px;text-align:left;vertical-align:top}
+th{background:#f1f5f9}.tag{display:inline-block;padding:2px 8px;border-radius:99px;font-size:12px;color:#fff}
+.s-pending_atc{background:#b45309}.s-released{background:#15803d}.s-withdrawn{background:#6b7280}.s-void{background:#9f1239}.s-held{background:#c026d3}
+.muted{color:#64748b}.codes{color:#b91c1c}
+</style>
+<h1>航班恢复控制台 · 空管批复对账</h1>
+<p>提交方案按版本登记待批事项；批复到达后复核宵禁、维护、执勤与临时额度，只放行通过的航班。</p>
+<section>
+  用户 <input id="u" value="ops" style="width:90px"> 角色
+  <select id="r"><option>ops_manager</option><option>scheduler</option><option selected>atc</option><option>auditor</option><option>viewer</option></select>
+  <button onclick="load()">刷新</button>
+  筛选
+  <select id="f" onchange="load()"><option value="">全部事项</option><option value="pending_atc">待批</option><option value="held">暂缓(复核未过)</option><option value="released">已放行</option><option value="withdrawn">已撤回</option><option value="void">旧版失效</option></select>
+  <button class="atc" onclick="retryAll()">重试全部未完成项</button>
+  <span id="counts" class="muted"></span>
+</section>
+<section><h3>临时起降额度</h3><div id="pools"></div></section>
+<section><h3>批复事项</h3><div id="items"></div></section>
+<section><h3>航班 / 方案状态</h3><pre id="o">加载中…</pre></section>
+<script>
+const H=()=>({'X-User-Id':u.value,'X-Role':r.value});
+function tag(s){return `<span class="tag s-${s}">${s}</span>`}
+async function api(path,opt){let x=await fetch(path,Object.assign({headers:Object.assign({'Content-Type':'application/json'},H())},opt));return x.json()}
+async function load(){
+  const st=await api('/api/state');o.textContent=JSON.stringify({flights:st.flights,plans:st.plans.map(p=>({id:p.id,name:p.name,status:p.status,revision:p.revision}))},null,2);
+  const d=await api('/api/approvals'+(f.value?`?status=${f.value}`:''));
+  counts.textContent=' 汇总: '+Object.entries(d.status_counts).map(([k,v])=>`${k}=${v}`).join('  ');
+  pools.innerHTML='<table><tr><th>机场</th><th>窗口</th><th>容量</th><th>已占用</th><th>剩余</th></tr>'+
+    d.slot_pools.map(p=>`<tr><td>${p.airport_code}</td><td>${p.window_start} → ${p.window_end}</td><td>${p.capacity}</td><td>${p.used}</td><td>${p.remaining}</td></tr>`).join('')+'</table>';
+  items.innerHTML=d.items.length?('<table><tr><th>事项号</th><th>版本</th><th>航班</th><th>状态</th><th>空管文号/决定</th><th>复核/撤回原因</th><th>步骤</th><th>操作</th></tr>'+
+    d.items.map(it=>{
+      const codes=(it.check_codes||[]).length?`<div class="codes">${it.check_codes.join(', ')}</div>`:'';
+      const reason=it.withdraw_reason?`<div>${it.withdraw_reason}</div>`:'';
+      const acts=[];
+      if(it.status==='pending_atc'||it.status==='held'){
+        acts.push(`<button class="atc" onclick="decide('${it.item_no}','approved')">批准</button>`);
+        acts.push(`<button class="danger" onclick="withdraw('${it.item_no}')">撤回</button>`);
+      }
+      if(it.status==='held')acts.push(`<button onclick="retry('${it.item_no}')">重试</button>`);
+      return `<tr><td>${it.item_no}</td><td>R${it.revision}</td><td>${it.snapshot.flight_no}<br><span class="muted">${it.snapshot.origin}→${it.snapshot.destination}<br>${it.snapshot.new_std}</span></td>
+      <td>${tag(it.status)}</td><td>${it.decision||''} ${it.atc_ref?`<span class="muted">${it.atc_ref}</span>`:''}</td>
+      <td>${codes}${reason}</td><td class="muted">${it.steps.map(s=>s.step+':'+s.result).join('<br>')}</td><td>${acts.join(' ')}</td></tr>`;
+    }).join('')+'</table>'):'<p class="muted">无事项</p>';
+}
+async function decide(no,decision){
+  let ref=prompt('空管批准文号 atc_ref（可空）','ATC-')||'';
+  const r=await api(`/api/approvals/${no}`,{method:'POST',body:JSON.stringify({decision,atc_ref:ref})});
+  if(r.error){alert(r.message);return}
+  if(r.write_failed)alert(`写入失败于步骤 ${r.write_failed.step}，请按事项号重试 ${no}`);
+  load();
+}
+async function withdraw(no){
+  let reason=prompt('撤回原因','');if(reason===null)return;
+  const r=await api(`/api/approvals/${no}`,{method:'POST',body:JSON.stringify({decision:'withdrawn',reason})});
+  if(r.error){alert(r.message);return}
+  load();
+}
+async function retry(no){const r=await api('/api/approvals/retry',{method:'POST',body:JSON.stringify({item_no:no})});alert(JSON.stringify(r.results));load()}
+async function retryAll(){const r=await api('/api/approvals/retry',{method:'POST',body:'{}'});alert('重试 '+r.retry_count+' 项');load()}
+load();
+</script>
